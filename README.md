@@ -4,110 +4,196 @@
 
 Homework assignments for the course Backend development in the Master's program [Machine Learning in a Digital Product](https://www.hse.ru/en/ma/mldp/) (HSE University, Faculty of Computer Science & Avito)
 
-### Setup
-
-```bash
-# Clone the repository
-git clone https://github.com/tlidzhiev/avito-backend-course.git
-cd avito-backend-course
-
-# Install uv (if not already installed)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Create virtual environment
-uv venv --python 3.12.11
-source .venv/bin/activate
-
-# Install dependencies via uv
-uv sync --all-groups
-
-# Install pre-commit
-pre-commit install
-```
-
 ## Project Structure
 
 ```
 avito-backend-course/
+├── migrations/
+│   ├── V1__create_users_and_items.sql       # users and advertisements tables
+│   ├── V2__create_moderation_results.sql    # moderation_results table
+│   └── V4__rename_tables.sql                # rename sellers→users, ads→advertisements
 ├── src/
-│   ├── api/              # API endpoints
-│   │   ├── moderation.py # Moderation endpoint
-│   │   └── routers.py    # Router configuration
-│   ├── schemas/          # Pydantic models
-│   │   └── ad.py         # Ad request/response schemas
-│   ├── services/         # Business logic
-│   │   └── moderation.py # Moderation service
-│   └── main.py           # FastAPI application entry point
+│   ├── api/
+│   │   ├── moderation.py   # API endpoints
+│   │   └── routers.py
+│   ├── clients/
+│   │   └── kafka.py        # Kafka producer (KafkaModerationProducer)
+│   ├── ml/
+│   │   └── model.py        # LogisticRegression model
+│   ├── repositories/
+│   │   ├── db.py                    # asyncpg pool management
+│   │   ├── items.py                 # advertisements repository
+│   │   ├── moderation_results.py    # moderation_results repository
+│   │   └── users.py                 # users repository
+│   ├── schemas/
+│   │   ├── ad.py           # AdRequest / AdResponse
+│   │   └── moderation.py   # AsyncModerationResponse / ModerationResultResponse
+│   ├── services/
+│   │   └── moderation.py   # ModerationService
+│   ├── workers/
+│   │   └── moderation_worker.py  # Kafka consumer with retry and DLQ
+│   └── main.py
 ├── tests/
-│   └── test_moderation.py # Unit tests for moderation endpoint
-├── pyproject.toml        # Project configuration and dependencies
-└── README.md             # This file
+│   ├── test_moderation.py           # unit tests
+│   └── test_kafka_integration.py    # integration tests (require running Kafka)
+├── docker-compose.yaml
+└── pyproject.toml
 ```
 
-
-## Usage
-
-### Start the development server
+## Setup
 
 ```bash
-# Activate virtual environment (if not already activated)
-source .venv/bin/activate
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Run the FastAPI application
-fastapi dev src/main.py
+# Install dependencies
+uv sync --all-groups
+
+# Install pre-commit hooks
+pre-commit install
 ```
 
-The API will be available at `http://localhost:8000`
+## Running the Project
 
-### API Documentation
+### 1. Start infrastructure (PostgreSQL + Kafka/Redpanda)
 
-Once the server is running, you can access:
-- Swagger UI: `http://localhost:8000/docs`
+```bash
+docker compose up -d
+```
 
-### API Endpoints
+### 2. Apply migrations
 
-#### POST /moderation/predict
+```bash
+uv run pgmigrate -c "postgresql://avito:avito@localhost:5432/avito" -t latest migrate
+```
 
-Predicts whether an ad should be approved for moderation.
+### 3. Start the API server
 
-**Request Body:**
+```bash
+DATABASE_URL=postgresql://avito:avito@localhost:5432/avito \
+KAFKA_BOOTSTRAP_SERVERS=localhost:9092 \
+uv run fastapi dev src/main.py
+```
+
+### 4. Start the moderation worker (separate terminal)
+
+```bash
+DATABASE_URL=postgresql://avito:avito@localhost:5432/avito \
+KAFKA_BOOTSTRAP_SERVERS=localhost:9092 \
+uv run python -m src.workers.moderation_worker
+```
+
+### Environment variables
+
+| Variable | Value |
+|---|---|
+| `DATABASE_URL` | `postgresql://avito:avito@localhost:5432/avito` |
+| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` |
+
+### Useful links
+
+- API: http://localhost:8000
+- Swagger UI: http://localhost:8000/docs
+- Redpanda Console (Kafka UI): http://localhost:8080
+
+## API Endpoints
+
+### POST /moderation/predict
+
+Synchronous prediction — all ad data passed in the request body, no DB required.
+
+**Request:**
 ```json
 {
   "seller_id": 1,
-  "is_verified_seller": true,
-  "item_id": 100,
-  "name": "Product Name",
-  "description": "Product Description",
+  "is_verified_seller": false,
+  "item_id": 1,
+  "name": "iPhone 13",
+  "description": "Good condition",
   "category": 1,
-  "images_qty": 5
+  "images_qty": 3
 }
 ```
 
 **Response:**
 ```json
 {
-  "is_approved": true
+  "is_violation": false,
+  "probability": 0.12
 }
 ```
 
-**Business Logic:**
-- Verified sellers (`is_verified_seller: true`) are always approved
-- Unverified sellers are approved only if they have at least one image (`images_qty > 0`)
+### POST /moderation/simple_predict?item_id=1
+
+Synchronous prediction — fetches ad data from DB by `item_id`.
+
+**Response:**
+```json
+{
+  "is_violation": false,
+  "probability": 0.12
+}
+```
+
+### POST /moderation/async_predict?item_id=1
+
+Async prediction — sends the ad to Kafka for background processing by the worker.
+
+**Response:**
+```json
+{
+  "task_id": 42,
+  "status": "pending",
+  "message": "Moderation request accepted"
+}
+```
+
+### GET /moderation/moderation_result/{task_id}
+
+Returns the result of an async moderation task.
+
+**Response:**
+```json
+{
+  "task_id": 42,
+  "status": "completed",
+  "is_violation": false,
+  "probability": 0.12,
+  "error_message": null
+}
+```
+
+## Async Moderation Flow
+
+```
+Client
+  │
+  ├─ POST /async_predict?item_id=1
+  │       │
+  │       ├─ creates moderation_results record (status=pending)
+  │       └─ sends message to Kafka topic "moderation"
+  │
+Worker (moderation_worker.py)
+  │
+  ├─ consumes message from "moderation" topic
+  ├─ fetches item from DB
+  ├─ runs ML model
+  ├─ updates moderation_results (status=completed/failed)
+  │
+  └─ on temporary error: retries up to 3 times (via "moderation" topic)
+     on permanent error:  sends to DLQ topic "moderation_dlq"
+  │
+  ▼
+Client
+  └─ GET /moderation_result/{task_id}  →  { status: "completed", ... }
+```
 
 ## Testing
 
-### Run all tests
-
 ```bash
-# Activate virtual environment (if not already activated)
-source .venv/bin/activate
+# Unit tests
+uv run pytest tests/test_moderation.py -v
 
-# Run tests with pytest
-pytest tests/
-
-# Run tests with verbose output
-pytest tests/ -v
-
-# Run specific test file
-pytest tests/test_moderation.py -v
+# Integration tests (require running Kafka on localhost:9092)
+uv run pytest tests/test_kafka_integration.py -v
 ```

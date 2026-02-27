@@ -5,6 +5,7 @@ description = "Homework assignments for the course Backend development in the Ma
 readme = "README.md"
 requires-python = "==3.12.11"
 dependencies = [
+    "aiokafka==0.13.0",
     "asyncpg==0.31.0",
     "fastapi[standard]==0.128.0",
     "numpy==2.4.1",

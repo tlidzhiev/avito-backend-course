@@ -3,118 +3,128 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.repositories.ad import AdRepository
-from src.repositories.seller import SellerRepository
+from src.repositories.items import ItemsRepository
+from src.repositories.users import UsersRepository
 
 
 @pytest.fixture
 def mock_pool():
     pool = MagicMock()
-    pool.fetchrow = AsyncMock()
-    return pool
+    conn = AsyncMock()
+    conn.execute = AsyncMock()
+    conn.fetchrow = AsyncMock()
+
+    acquire_ctx = AsyncMock()
+    acquire_ctx.__aenter__.return_value = conn
+    pool.acquire.return_value = acquire_ctx
+
+    return pool, conn
 
 
-def test_create_seller(mock_pool):
-    mock_pool.fetchrow.return_value = {'id': 1, 'name': 'Test Seller', 'is_verified': True}
+@pytest.fixture
+def mock_pool_getter(mock_pool):
+    pool, conn = mock_pool
+    return lambda: pool
 
-    repo = SellerRepository(mock_pool)
-    result = asyncio.new_event_loop().run_until_complete(
-        repo.create(name='Test Seller', is_verified=True)
-    )
 
-    assert result == {'id': 1, 'name': 'Test Seller', 'is_verified': True}
-    mock_pool.fetchrow.assert_called_once()
-    call_args = mock_pool.fetchrow.call_args
-    assert 'INSERT INTO sellers' in call_args[0][0]
-    assert call_args[0][1] == 'Test Seller'
+def test_create_user(mock_pool, mock_pool_getter):
+    pool, conn = mock_pool
+
+    repo = UsersRepository(pool_getter=mock_pool_getter)
+    asyncio.run(repo.create_user(seller_id=1, is_verified_seller=True))
+
+    conn.execute.assert_called_once()
+    call_args = conn.execute.call_args
+    assert 'INSERT INTO users' in call_args[0][0]
+    assert call_args[0][1] == 1
     assert call_args[0][2] is True
 
 
-def test_get_seller_by_id(mock_pool):
-    mock_pool.fetchrow.return_value = {'id': 1, 'name': 'Test Seller', 'is_verified': False}
+def test_get_user_by_id(mock_pool, mock_pool_getter):
+    pool, conn = mock_pool
+    conn.fetchrow.return_value = {'id': 1, 'is_verified_seller': False}
 
-    repo = SellerRepository(mock_pool)
-    result = asyncio.new_event_loop().run_until_complete(repo.get_by_id(1))
+    repo = UsersRepository(pool_getter=mock_pool_getter)
+    result = asyncio.run(repo.get_user_by_id(1))
 
-    assert result == {'id': 1, 'name': 'Test Seller', 'is_verified': False}
-    mock_pool.fetchrow.assert_called_once()
-    call_args = mock_pool.fetchrow.call_args
+    assert result == {'seller_id': 1, 'is_verified_seller': False}
+    conn.fetchrow.assert_called_once()
+    call_args = conn.fetchrow.call_args
     assert 'SELECT' in call_args[0][0]
     assert call_args[0][1] == 1
 
 
-def test_get_seller_by_id_not_found(mock_pool):
-    mock_pool.fetchrow.return_value = None
+def test_get_user_by_id_not_found(mock_pool, mock_pool_getter):
+    pool, conn = mock_pool
+    conn.fetchrow.return_value = None
 
-    repo = SellerRepository(mock_pool)
-    result = asyncio.new_event_loop().run_until_complete(repo.get_by_id(999))
+    repo = UsersRepository(pool_getter=mock_pool_getter)
+    result = asyncio.run(repo.get_user_by_id(999))
 
     assert result is None
 
 
-def test_create_ad(mock_pool):
-    mock_pool.fetchrow.return_value = {
-        'id': 1,
-        'seller_id': 10,
-        'name': 'Test Ad',
-        'description': 'Description',
-        'category': 5,
-        'images_qty': 3,
-    }
+def test_create_item(mock_pool, mock_pool_getter):
+    pool, conn = mock_pool
 
-    repo = AdRepository(mock_pool)
-    result = asyncio.new_event_loop().run_until_complete(
-        repo.create(
-            seller_id=10, name='Test Ad', description='Description', category=5, images_qty=3
+    repo = ItemsRepository(pool_getter=mock_pool_getter)
+    asyncio.run(
+        repo.create_item(
+            item_id=1,
+            seller_id=10,
+            name='Test Ad',
+            description='Description',
+            category=5,
+            images_qty=3,
         )
     )
 
-    assert result == {
-        'id': 1,
+    conn.execute.assert_called_once()
+    call_args = conn.execute.call_args
+    assert 'INSERT INTO advertisements' in call_args[0][0]
+    assert call_args[0][1] == 1
+    assert call_args[0][2] == 10
+    assert call_args[0][3] == 'Test Ad'
+    assert call_args[0][4] == 'Description'
+    assert call_args[0][5] == 5
+    assert call_args[0][6] == 3
+
+
+def test_get_item_by_id(mock_pool, mock_pool_getter):
+    pool, conn = mock_pool
+    conn.fetchrow.return_value = {
         'seller_id': 10,
+        'is_verified_seller': True,
+        'item_id': 1,
         'name': 'Test Ad',
         'description': 'Description',
         'category': 5,
         'images_qty': 3,
     }
-    mock_pool.fetchrow.assert_called_once()
-    call_args = mock_pool.fetchrow.call_args
-    assert 'INSERT INTO ads' in call_args[0][0]
-    assert call_args[0][1] == 10
-    assert call_args[0][2] == 'Test Ad'
 
-
-def test_get_ad_by_id(mock_pool):
-    mock_pool.fetchrow.return_value = {
-        'id': 1,
-        'seller_id': 10,
-        'name': 'Test Ad',
-        'description': 'Description',
-        'category': 5,
-        'images_qty': 3,
-    }
-
-    repo = AdRepository(mock_pool)
-    result = asyncio.new_event_loop().run_until_complete(repo.get_by_id(1))
+    repo = ItemsRepository(pool_getter=mock_pool_getter)
+    result = asyncio.run(repo.get_item_by_id(1))
 
     assert result == {
-        'id': 1,
         'seller_id': 10,
+        'is_verified_seller': True,
+        'item_id': 1,
         'name': 'Test Ad',
         'description': 'Description',
         'category': 5,
         'images_qty': 3,
     }
-    mock_pool.fetchrow.assert_called_once()
-    call_args = mock_pool.fetchrow.call_args
+    conn.fetchrow.assert_called_once()
+    call_args = conn.fetchrow.call_args
     assert 'SELECT' in call_args[0][0]
     assert call_args[0][1] == 1
 
 
-def test_get_ad_by_id_not_found(mock_pool):
-    mock_pool.fetchrow.return_value = None
+def test_get_item_by_id_not_found(mock_pool, mock_pool_getter):
+    pool, conn = mock_pool
+    conn.fetchrow.return_value = None
 
-    repo = AdRepository(mock_pool)
-    result = asyncio.new_event_loop().run_until_complete(repo.get_by_id(999))
+    repo = ItemsRepository(pool_getter=mock_pool_getter)
+    result = asyncio.run(repo.get_item_by_id(999))
 
     assert result is None
