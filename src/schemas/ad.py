@@ -11,6 +11,12 @@ class AdRequest(BaseModel):
     images_qty: int
 
 
+class SimpleAdRequest(BaseModel):
+    item_id: int
+
+
 class AdResponse(BaseModel):
     is_violation: bool
     probability: float
+
+

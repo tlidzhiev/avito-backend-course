@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from src.api.routers import api_router
+from src.db import close_db_pool, init_db_pool
 from src.ml.model import load_model, save_model, train_model
 
 logger = logging.getLogger(__name__)
@@ -24,11 +25,20 @@ async def lifespan(app: FastAPI):
     else:
         logger.info('Model loaded successfully')
 
-    from src.api.moderation import set_model_getter
+    from src.api.moderation import set_db_pool, set_model_getter
 
     set_model_getter(get_model)
+
+    logger.info('Connecting to database...')
+    pool = await init_db_pool()
+    set_db_pool(pool)
+    logger.info('Database connection pool created')
+
     yield
+
     logger.info('Shutting down...')
+    await close_db_pool(pool)
+    logger.info('Database connection pool closed')
 
 
 def get_model():
