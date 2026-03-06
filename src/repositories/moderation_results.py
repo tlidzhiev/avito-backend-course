@@ -68,9 +68,7 @@ class ModerationResultsRepository:
 
         return int(task_id) if task_id is not None else None
 
-    async def update_completed(
-        self, task_id: int, is_violation: bool, probability: float
-    ) -> None:
+    async def update_completed(self, task_id: int, is_violation: bool, probability: float) -> None:
         pool = self.pool_getter()
         if pool is None:
             raise RuntimeError('Database pool is not available')
@@ -107,3 +105,12 @@ class ModerationResultsRepository:
                 error_message,
                 datetime.now(UTC).replace(tzinfo=None),
             )
+
+    async def delete_by_item(self, item_id: int) -> None:
+        pool = self.pool_getter()
+        if pool is None:
+            raise RuntimeError('Database pool is not available')
+
+        query = 'DELETE FROM moderation_results WHERE item_id = $1'
+        async with pool.acquire() as conn:
+            await conn.execute(query, item_id)

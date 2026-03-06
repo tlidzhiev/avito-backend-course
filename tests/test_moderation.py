@@ -40,9 +40,20 @@ class _FakeAcquire:
         return False
 
 
+class _FakeTransaction:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+
 class _FakeConnection:
     def __init__(self, pool):
         self.pool = pool
+
+    def transaction(self):
+        return _FakeTransaction()
 
     async def execute(self, query, *args):
         if 'INSERT INTO users' in query:
@@ -62,8 +73,16 @@ class _FakeConnection:
                 'description': description,
                 'category': category,
                 'images_qty': images_qty,
+                'is_closed': False,
             }
             return 'INSERT 0 1'
+
+        if 'DELETE FROM advertisements WHERE id = $1' in query:
+            item_id = args[0]
+            if item_id not in self.pool.items:
+                return 'DELETE 0'
+            del self.pool.items[item_id]
+            return 'DELETE 1'
 
         if 'UPDATE moderation_results' in query and "status = 'completed'" in query:
             task_id, is_violation, probability, processed_at = args
@@ -86,6 +105,17 @@ class _FakeConnection:
             result['error_message'] = error_message
             result['processed_at'] = processed_at
             return 'UPDATE 1'
+
+        if 'DELETE FROM moderation_results WHERE item_id = $1' in query:
+            item_id = args[0]
+            task_ids = [
+                task_id
+                for task_id, payload in self.pool.moderation_results.items()
+                if payload['item_id'] == item_id
+            ]
+            for task_id in task_ids:
+                del self.pool.moderation_results[task_id]
+            return f'DELETE {len(task_ids)}'
 
         raise ValueError(f'Unexpected query in execute: {query}')
 
@@ -129,6 +159,8 @@ class _FakeConnection:
             item = self.pool.items.get(item_id)
             if item is None:
                 return None
+            if item.get('is_closed'):
+                return None
 
             user = self.pool.users.get(item['seller_id'])
             if user is None:
@@ -163,6 +195,32 @@ class _FakePool:
 
     def acquire(self):
         return _FakeAcquire(_FakeConnection(self))
+
+
+class _FakeCacheRepository:
+    def __init__(self):
+        self.simple = {}
+        self.task = {}
+        self.task_ids_by_item = {}
+
+    async def get_simple_prediction(self, item_id: int):
+        return self.simple.get(item_id)
+
+    async def set_simple_prediction(self, item_id: int, payload: dict):
+        self.simple[item_id] = payload
+
+    async def get_moderation_result(self, task_id: int):
+        return self.task.get(task_id)
+
+    async def set_moderation_result(self, task_id: int, item_id: int, payload: dict):
+        self.task[task_id] = payload
+        self.task_ids_by_item.setdefault(item_id, set()).add(task_id)
+
+    async def delete_item_predictions(self, item_id: int):
+        self.simple.pop(item_id, None)
+        for task_id in self.task_ids_by_item.get(item_id, set()):
+            self.task.pop(task_id, None)
+        self.task_ids_by_item.pop(item_id, None)
 
 
 class _FakeKafkaProducer:
@@ -234,6 +292,7 @@ def _find_ad_by_prediction(model, target: int) -> AdRequest | None:
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.delenv('DATABASE_URL', raising=False)
+    monkeypatch.delenv('REDIS_URL', raising=False)
     monkeypatch.delenv('KAFKA_BOOTSTRAP_SERVERS', raising=False)
     monkeypatch.delenv('KAFKA_MODERATION_TOPIC', raising=False)
     monkeypatch.delenv('KAFKA_DLQ_TOPIC', raising=False)
@@ -427,6 +486,21 @@ def test_simple_predict_invalid_item_id(client):
     assert response.status_code == 422
 
 
+def test_simple_predict_uses_cache(client, monkeypatch):
+    from src import main
+    from src.api import moderation as moderation_api
+
+    fake_cache = _FakeCacheRepository()
+    asyncio.run(fake_cache.set_simple_prediction(100, {'is_violation': True, 'probability': 0.88}))
+
+    monkeypatch.setattr(main, 'get_db_pool', lambda: None)
+    monkeypatch.setattr(moderation_api, '_get_cache_repository', lambda: fake_cache)
+
+    response = client.post('/moderation/simple_predict', params={'item_id': 100})
+    assert response.status_code == 200
+    assert response.json() == {'is_violation': True, 'probability': 0.88}
+
+
 def test_async_predict_success(client, monkeypatch):
     from src import main
 
@@ -528,6 +602,31 @@ def test_moderation_result_pending(client, monkeypatch):
     }
 
 
+def test_moderation_result_pending_not_stored_to_cache(client, monkeypatch):
+    from src import main
+    from src.api import moderation as moderation_api
+
+    fake_pool = _FakePool()
+    fake_pool.moderation_results[1] = {
+        'id': 1,
+        'item_id': 100,
+        'status': 'pending',
+        'is_violation': None,
+        'probability': None,
+        'error_message': None,
+        'created_at': None,
+        'processed_at': None,
+    }
+    fake_cache = _FakeCacheRepository()
+
+    monkeypatch.setattr(main, 'get_db_pool', lambda: fake_pool)
+    monkeypatch.setattr(moderation_api, '_get_cache_repository', lambda: fake_cache)
+
+    response = client.get('/moderation/moderation_result/1')
+    assert response.status_code == 200
+    assert fake_cache.task == {}
+
+
 def test_moderation_result_not_found(client, monkeypatch):
     from src import main
 
@@ -536,6 +635,151 @@ def test_moderation_result_not_found(client, monkeypatch):
     response = client.get('/moderation/moderation_result/1')
     assert response.status_code == 404
     assert 'not found' in response.json()['detail'].lower()
+
+
+def test_moderation_result_uses_cache(client, monkeypatch):
+    from src import main
+    from src.api import moderation as moderation_api
+
+    fake_cache = _FakeCacheRepository()
+    asyncio.run(
+        fake_cache.set_moderation_result(
+            task_id=1,
+            item_id=100,
+            payload={
+                'task_id': 1,
+                'status': 'completed',
+                'is_violation': False,
+                'probability': 0.01,
+                'error_message': None,
+            },
+        )
+    )
+
+    monkeypatch.setattr(main, 'get_db_pool', lambda: None)
+    monkeypatch.setattr(moderation_api, '_get_cache_repository', lambda: fake_cache)
+
+    response = client.get('/moderation/moderation_result/1')
+    assert response.status_code == 200
+    assert response.json() == {
+        'task_id': 1,
+        'status': 'completed',
+        'is_violation': False,
+        'probability': 0.01,
+        'error_message': None,
+    }
+
+
+def test_moderation_result_ignores_pending_value_from_cache(client, monkeypatch):
+    from src import main
+    from src.api import moderation as moderation_api
+
+    fake_pool = _FakePool()
+    fake_pool.moderation_results[1] = {
+        'id': 1,
+        'item_id': 100,
+        'status': 'completed',
+        'is_violation': True,
+        'probability': 0.95,
+        'error_message': None,
+        'created_at': None,
+        'processed_at': None,
+    }
+    fake_cache = _FakeCacheRepository()
+    asyncio.run(
+        fake_cache.set_moderation_result(
+            task_id=1,
+            item_id=100,
+            payload={
+                'task_id': 1,
+                'status': 'pending',
+                'is_violation': None,
+                'probability': None,
+                'error_message': None,
+            },
+        )
+    )
+
+    monkeypatch.setattr(main, 'get_db_pool', lambda: fake_pool)
+    monkeypatch.setattr(moderation_api, '_get_cache_repository', lambda: fake_cache)
+
+    response = client.get('/moderation/moderation_result/1')
+    assert response.status_code == 200
+    assert response.json() == {
+        'task_id': 1,
+        'status': 'completed',
+        'is_violation': True,
+        'probability': 0.95,
+        'error_message': None,
+    }
+    assert fake_cache.task[1]['status'] == 'completed'
+
+
+def test_close_item_success(client, monkeypatch):
+    from src import main
+    from src.api import moderation as moderation_api
+
+    fake_pool = _FakePool()
+    fake_pool.users[1] = {'id': 1, 'is_verified_seller': True}
+    fake_pool.items[100] = {
+        'item_id': 100,
+        'seller_id': 1,
+        'name': 'Close item',
+        'description': 'Close desc',
+        'category': 1,
+        'images_qty': 1,
+        'is_closed': False,
+    }
+    fake_pool.moderation_results[1] = {
+        'id': 1,
+        'item_id': 100,
+        'status': 'completed',
+        'is_violation': False,
+        'probability': 0.1,
+        'error_message': None,
+        'created_at': None,
+        'processed_at': None,
+    }
+    fake_cache = _FakeCacheRepository()
+    asyncio.run(fake_cache.set_simple_prediction(100, {'is_violation': False, 'probability': 0.1}))
+    asyncio.run(
+        fake_cache.set_moderation_result(
+            task_id=1,
+            item_id=100,
+            payload={
+                'task_id': 1,
+                'status': 'completed',
+                'is_violation': False,
+                'probability': 0.1,
+                'error_message': None,
+            },
+        )
+    )
+
+    monkeypatch.setattr(main, 'get_db_pool', lambda: fake_pool)
+    monkeypatch.setattr(moderation_api, '_get_cache_repository', lambda: fake_cache)
+
+    response = client.post('/moderation/close', params={'item_id': 100})
+    assert response.status_code == 200
+    assert response.json() == {'item_id': 100, 'status': 'closed'}
+    assert 100 not in fake_pool.items
+    assert fake_pool.moderation_results == {}
+    assert fake_cache.simple == {}
+    assert fake_cache.task == {}
+
+
+def test_close_item_not_found(client, monkeypatch):
+    from src import main
+    from src.api import moderation as moderation_api
+
+    fake_pool = _FakePool()
+    fake_cache = _FakeCacheRepository()
+
+    monkeypatch.setattr(main, 'get_db_pool', lambda: fake_pool)
+    monkeypatch.setattr(moderation_api, '_get_cache_repository', lambda: fake_cache)
+
+    response = client.post('/moderation/close', params={'item_id': 100})
+    assert response.status_code == 404
 
 
 def test_users_repository_create_and_get():

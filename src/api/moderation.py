@@ -3,10 +3,15 @@ import logging
 from fastapi import APIRouter, HTTPException, Query
 
 from src.clients.kafka import KafkaModerationProducer
+from src.repositories.cache import CacheRepository
 from src.repositories.items import ItemsRepository
 from src.repositories.moderation_results import ModerationResultsRepository
 from src.schemas.ad import AdRequest, AdResponse
-from src.schemas.moderation import AsyncModerationResponse, ModerationResultResponse
+from src.schemas.moderation import (
+    AsyncModerationResponse,
+    CloseItemResponse,
+    ModerationResultResponse,
+)
 from src.services.moderation import ModerationService
 
 logger = logging.getLogger(__name__)
@@ -18,6 +23,9 @@ INT32_MAX = 2_147_483_647
 _get_model_func = None
 _get_db_pool_func = None
 _get_kafka_producer_func = None
+_get_redis_func = None
+
+CACHE_TTL_SECONDS = 300
 
 
 def set_model_getter(func) -> None:
@@ -35,6 +43,11 @@ def set_kafka_producer_getter(func) -> None:
     _get_kafka_producer_func = func
 
 
+def set_redis_getter(func) -> None:
+    global _get_redis_func
+    _get_redis_func = func
+
+
 def _get_db_pool():
     if _get_db_pool_func is None:
         return None
@@ -45,6 +58,12 @@ def _get_kafka_producer() -> KafkaModerationProducer | None:
     if _get_kafka_producer_func is None:
         return None
     return _get_kafka_producer_func()
+
+
+def _get_cache_repository() -> CacheRepository:
+    if _get_redis_func is None:
+        return CacheRepository(lambda: None, ttl_seconds=CACHE_TTL_SECONDS)
+    return CacheRepository(_get_redis_func, ttl_seconds=CACHE_TTL_SECONDS)
 
 
 @router.post('/predict', response_model=AdResponse)
@@ -68,6 +87,14 @@ async def predict(request: AdRequest) -> AdResponse:
 
 @router.post('/simple_predict', response_model=AdResponse)
 async def simple_predict(item_id: int = Query(..., ge=1, le=INT32_MAX)) -> AdResponse:
+    cache_repository = _get_cache_repository()
+    cached_response = await cache_repository.get_simple_prediction(item_id=item_id)
+    if cached_response is not None:
+        return AdResponse(
+            is_violation=bool(cached_response['is_violation']),
+            probability=float(cached_response['probability']),
+        )
+
     if _get_model_func is None:
         logger.error('Model getter not initialized')
         raise HTTPException(status_code=503, detail='Model is not available')
@@ -90,6 +117,13 @@ async def simple_predict(item_id: int = Query(..., ge=1, le=INT32_MAX)) -> AdRes
     request = AdRequest(**ad_data)
     try:
         is_violation, probability = await service.predict_moderation(request, model)
+        await cache_repository.set_simple_prediction(
+            item_id=item_id,
+            payload={
+                'is_violation': is_violation,
+                'probability': probability,
+            },
+        )
         return AdResponse(is_violation=is_violation, probability=probability)
     except Exception as e:
         logger.error(f'Error during prediction: {str(e)}', exc_info=True)
@@ -120,7 +154,9 @@ async def async_predict(item_id: int = Query(..., ge=1, le=INT32_MAX)) -> AsyncM
     except Exception as exc:
         if task_id is not None:
             try:
-                await moderation_results_repository.update_failed(task_id=task_id, error_message=str(exc))
+                await moderation_results_repository.update_failed(
+                    task_id=task_id, error_message=str(exc)
+                )
             except Exception:
                 logger.exception('Failed to mark task as failed for task_id=%s', task_id)
         logger.error('Error creating async moderation task: %s', exc, exc_info=True)
@@ -138,6 +174,19 @@ async def moderation_result(task_id: int) -> ModerationResultResponse:
     if task_id < 1:
         raise HTTPException(status_code=422, detail='task_id must be greater than or equal to 1')
 
+    cache_repository = _get_cache_repository()
+    cached_result = await cache_repository.get_moderation_result(task_id=task_id)
+    if cached_result is not None:
+        cached_status = str(cached_result.get('status'))
+        if cached_status in {'completed', 'failed'}:
+            return ModerationResultResponse(
+                task_id=int(cached_result['task_id']),
+                status=cached_status,
+                is_violation=cached_result.get('is_violation'),
+                probability=cached_result.get('probability'),
+                error_message=cached_result.get('error_message'),
+            )
+
     pool = _get_db_pool()
     if pool is None:
         raise HTTPException(status_code=503, detail='Database is not available')
@@ -147,10 +196,34 @@ async def moderation_result(task_id: int) -> ModerationResultResponse:
     if result is None:
         raise HTTPException(status_code=404, detail='Task not found')
 
-    return ModerationResultResponse(
+    response = ModerationResultResponse(
         task_id=result['task_id'],
         status=result['status'],
         is_violation=result['is_violation'],
         probability=result['probability'],
         error_message=result['error_message'],
     )
+    if response.status in {'completed', 'failed'}:
+        await cache_repository.set_moderation_result(
+            task_id=response.task_id,
+            item_id=int(result['item_id']),
+            payload=response.model_dump(),
+        )
+    return response
+
+
+@router.post('/close', response_model=CloseItemResponse)
+async def close_item(item_id: int = Query(..., ge=1, le=INT32_MAX)) -> CloseItemResponse:
+    pool = _get_db_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail='Database is not available')
+
+    items_repository = ItemsRepository(lambda: pool)
+    cache_repository = _get_cache_repository()
+
+    closed = await items_repository.close_item(item_id=item_id)
+    if not closed:
+        raise HTTPException(status_code=404, detail='Item not found')
+
+    await cache_repository.delete_item_predictions(item_id=item_id)
+    return CloseItemResponse(item_id=item_id, status='closed')

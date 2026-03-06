@@ -5,6 +5,7 @@ from fastapi import FastAPI
 
 from src.api.routers import api_router
 from src.clients.kafka import KafkaModerationProducer
+from src.clients.redis import close_redis, get_redis_client, init_redis
 from src.ml.model import load_model, save_model, train_model
 from src.repositories.db import close_db, get_db_pool, init_db
 
@@ -41,19 +42,24 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning('Kafka producer is disabled: KAFKA_BOOTSTRAP_SERVERS is not set')
 
+    await init_redis()
+
     from src.api.moderation import (
         set_db_pool_getter,
         set_kafka_producer_getter,
         set_model_getter,
+        set_redis_getter,
     )
 
     set_model_getter(get_model)
     set_db_pool_getter(get_db_pool)
     set_kafka_producer_getter(get_kafka_moderation_producer)
+    set_redis_getter(get_redis_client)
     yield
     if kafka_moderation_producer is not None:
         await kafka_moderation_producer.stop()
         kafka_moderation_producer = None
+    await close_redis()
     await close_db()
     logger.info('Shutting down...')
 

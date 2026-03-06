@@ -13,3 +13,8 @@ class ModerationResultResponse(BaseModel):
     is_violation: bool | None = None
     probability: float | None = None
     error_message: str | None = None
+
+
+class CloseItemResponse(BaseModel):
+    item_id: int
+    status: str
